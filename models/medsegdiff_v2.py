@@ -1,20 +1,19 @@
 """
 MedSegDiff-V2: Diffusion-based Medical Image Segmentation with Transformer
-Based on: Enhanced version with Vision Transformer
+Based on: https://arxiv.org/abs/2301.11798
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import UNet2DModel, DDPMScheduler
-from timm.models.vision_transformer import VisionTransformer
 import numpy as np
 
 
 class TransformerEncoder(nn.Module):
     """Vision Transformer encoder for feature extraction"""
 
-    def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512):
         super().__init__()
 
         # Patch embedding
@@ -138,13 +137,14 @@ class MedSegDiffV2(nn.Module):
 
     def __init__(self, in_channels=3, num_classes=1, image_size=256,
                  num_train_timesteps=1000, beta_schedule="linear",
-                 num_inference_steps=50):
+                 num_inference_steps=50, **kwargs):
         super().__init__()
 
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.image_size = image_size
         self.num_inference_steps = num_inference_steps
+        self.num_train_timesteps = num_train_timesteps
 
         # Transformer-based conditional UNet
         self.model = TransformerConditionalUNet(

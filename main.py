@@ -1,7 +1,7 @@
 """
 Main script for training and evaluating diffusion-based segmentation models
 Supports: Diff-UNet, MedSegDiff, MedSegDiff-V2, SegGuidedDiff, DiffOSeg
-Datasets: ISIC 2016, DRIVE
+Datasets: ISIC 2016, GlaS
 """
 
 import os
@@ -28,52 +28,94 @@ from models.diffoseg import DiffOSeg, DiffOSegTrainer
 # Import metrics
 from metrics import MetricsTracker, SegmentationMetrics
 
-# ==================== HYPERPARAMETERS ====================
-CONFIGS = {
+# ==================== CENTRALIZED HYPERPARAMETERS ====================
+# All hyperparameters are managed centrally here for easy tuning
+HYPERPARAMETERS = {
     'isic2016': {
         'image_size': 256,
         'in_channels': 3,
         'num_classes': 1,
-        'batch_size': 16,
+        'batch_size': 4,
         'lr': 1e-4,
         'epochs': 200,
         'num_inference_steps': 50,
+        'num_train_timesteps': 1000,
+        'beta_schedule': 'linear',
+        'early_stop_patience': 5,
+        'early_stop_delta': 0.001,
     },
-    'drive': {
+    'glas': {
         'image_size': 512,
         'in_channels': 3,
         'num_classes': 1,
-        'batch_size': 8,
+        'batch_size': 2,
         'lr': 1e-4,
         'epochs': 200,
         'num_inference_steps': 50,
+        'num_train_timesteps': 1000,
+        'beta_schedule': 'linear',
+        'early_stop_patience': 5,
+        'early_stop_delta': 0.001,
     }
 }
 
-MODEL_SPECIFIC_CONFIGS = {
+# Model-specific hyperparameters
+MODEL_CONFIGS = {
     'diffu_net': {
-        'num_train_timesteps': 1000,
-        'beta_schedule': 'linear'
+        'use_ddim': False,
     },
     'medsegdiff': {
-        'num_train_timesteps': 1000,
-        'beta_schedule': 'linear'
+        'use_ddim': False,
     },
     'medsegdiff_v2': {
-        'num_train_timesteps': 1000,
-        'beta_schedule': 'linear'
+        'use_ddim': False,
     },
     'segguideddiff': {
-        'num_train_timesteps': 1000,
-        'beta_schedule': 'linear',
-        'use_ddim': True
+        'use_ddim': True,
     },
     'diffoseg': {
-        'num_train_timesteps': 1000,
-        'beta_schedule': 'linear',
-        'num_experts': 3
+        'num_experts': 3,
+        'use_ddim': False,
     }
 }
+
+
+# ==================== EARLY STOPPING ====================
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=5, delta=0, verbose=True, path='checkpoint.pth'):
+        self.patience = patience
+        self.delta = delta
+        self.verbose = verbose
+        self.path = path
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_score_max = -np.inf
+
+    def __call__(self, val_score, model):
+        score = val_score
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_score, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_score, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_score, model):
+        '''Saves model when validation score increases.'''
+        if self.verbose:
+            print(f'Validation score increased ({self.val_score_max:.6f} --> {val_score:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), self.path)
+        self.val_score_max = val_score
 
 
 # ==================== DATASET ====================
@@ -173,11 +215,14 @@ def create_model(model_name, config):
         'in_channels': config['in_channels'],
         'num_classes': config['num_classes'],
         'image_size': config['image_size'],
-        'num_inference_steps': config['num_inference_steps']
+        'num_inference_steps': config['num_inference_steps'],
+        'num_train_timesteps': config['num_train_timesteps'],
+        'beta_schedule': config['beta_schedule']
     }
 
     # Add model-specific configs
-    model_config = {**base_config, **MODEL_SPECIFIC_CONFIGS[model_name]}
+    model_specific = MODEL_CONFIGS.get(model_name, {})
+    model_config = {**base_config, **model_specific}
 
     if model_name == 'diffu_net':
         return DiffUNet(**model_config)
@@ -218,8 +263,10 @@ def train_model(model_name, dataset_name, data_dir, args):
     print(f"Training {model_name} on {dataset_name}")
     print(f"{'=' * 60}\n")
 
-    # Get config
-    config = CONFIGS[dataset_name].copy()
+    # Get config from centralized hyperparameters
+    config = HYPERPARAMETERS[dataset_name].copy()
+
+    # Override with command-line arguments if provided
     if args.batch_size:
         config['batch_size'] = args.batch_size
     if args.epochs:
@@ -236,7 +283,7 @@ def train_model(model_name, dataset_name, data_dir, args):
     )
 
     # Create model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = create_model(model_name, config)
 
     # Create optimizer
@@ -249,6 +296,14 @@ def train_model(model_name, dataset_name, data_dir, args):
     checkpoint_dir = Path(args.results_dir) / dataset_name / model_name / 'checkpoints'
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize early stopping
+    early_stopping = EarlyStopping(
+        patience=config['early_stop_patience'],
+        delta=config['early_stop_delta'],
+        verbose=True,
+        path=checkpoint_dir / 'best_model.pth'
+    )
+
     # Training loop
     best_dice = 0
     train_losses = []
@@ -259,22 +314,24 @@ def train_model(model_name, dataset_name, data_dir, args):
         train_loss = trainer.train_epoch(train_loader, epoch)
         train_losses.append(train_loss)
 
-        # Validate every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        # Validate every 5 epochs
+        if (epoch + 1) % 5 == 0:
             val_dice = trainer.validate(test_loader)
             val_dices.append(val_dice)
 
             print(f"Epoch {epoch + 1}/{config['epochs']}: "
                   f"Train Loss = {train_loss:.4f}, Val Dice = {val_dice:.4f}")
 
-            # Save best model
+            # Check early stopping
+            early_stopping(val_dice, model)
+
             if val_dice > best_dice:
                 best_dice = val_dice
-                torch.save(
-                    model.state_dict(),
-                    checkpoint_dir / 'best_model.pth'
-                )
-                print(f"Saved best model with Dice = {best_dice:.4f}")
+                print(f"New best Dice score: {best_dice:.4f}")
+
+            if early_stopping.early_stop:
+                print(f"Early stopping triggered at epoch {epoch + 1}")
+                break
         else:
             print(f"Epoch {epoch + 1}/{config['epochs']}: Train Loss = {train_loss:.4f}")
 
@@ -285,7 +342,8 @@ def train_model(model_name, dataset_name, data_dir, args):
     history = {
         'train_losses': train_losses,
         'val_dices': val_dices,
-        'best_dice': best_dice
+        'best_dice': best_dice,
+        'stopped_epoch': epoch + 1
     }
 
     with open(checkpoint_dir.parent / 'training_history.json', 'w') as f:
@@ -303,7 +361,7 @@ def evaluate_model(model_name, dataset_name, data_dir, args):
     print(f"{'=' * 60}\n")
 
     # Get config
-    config = CONFIGS[dataset_name].copy()
+    config = HYPERPARAMETERS[dataset_name].copy()
 
     # Create dataloader
     _, test_loader = get_dataloaders(
@@ -314,7 +372,7 @@ def evaluate_model(model_name, dataset_name, data_dir, args):
     )
 
     # Create model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = create_model(model_name, config)
 
     # Load checkpoint
@@ -324,7 +382,7 @@ def evaluate_model(model_name, dataset_name, data_dir, args):
         print(f"Checkpoint not found: {checkpoint_path}")
         return
 
-    model.load_state_dict(torch.load(checkpoint_path))
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model = model.to(device)
     model.eval()
 
@@ -373,7 +431,7 @@ def test_model(model_name, dataset_name, data_dir, args):
     print(f"{'=' * 60}\n")
 
     # Get config
-    config = CONFIGS[dataset_name].copy()
+    config = HYPERPARAMETERS[dataset_name].copy()
 
     # Create dataloader
     _, test_loader = get_dataloaders(
@@ -384,12 +442,12 @@ def test_model(model_name, dataset_name, data_dir, args):
     )
 
     # Create model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = create_model(model_name, config)
 
     # Load checkpoint
     checkpoint_path = Path(args.results_dir) / dataset_name / model_name / 'checkpoints' / 'best_model.pth'
-    model.load_state_dict(torch.load(checkpoint_path))
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model = model.to(device)
     model.eval()
 
@@ -497,7 +555,7 @@ def main():
 
     # Dataset
     parser.add_argument('--dataset', type=str, required=True,
-                        choices=['isic2016', 'drive'],
+                        choices=['isic2016', 'glas'],
                         help='Dataset name')
 
     parser.add_argument('--data_dir', type=str, default='./data',
@@ -507,7 +565,7 @@ def main():
     parser.add_argument('--models', type=str, default='all',
                         help='Models to run (comma-separated or "all")')
 
-    # Training hyperparameters
+    # Training hyperparameters (optional overrides)
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Batch size (default: from config)')
     parser.add_argument('--epochs', type=int, default=None,

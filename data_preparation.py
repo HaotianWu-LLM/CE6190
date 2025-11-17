@@ -19,8 +19,8 @@ class DatasetPreparator:
     def prepare(self):
         if self.dataset_name == 'isic2016':
             self.prepare_isic2016()
-        elif self.dataset_name == 'drive':
-            self.prepare_drive()
+        elif self.dataset_name == 'glas':
+            self.prepare_glas()
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
@@ -32,14 +32,6 @@ class DatasetPreparator:
         for split in ['train', 'test']:
             (self.dataset_dir / split / 'images').mkdir(parents=True, exist_ok=True)
             (self.dataset_dir / split / 'masks').mkdir(parents=True, exist_ok=True)
-
-        # URLs (Note: Replace with actual ISIC 2016 download links)
-        urls = {
-            'train_images': 'https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part1_Training_Data.zip',
-            'train_masks': 'https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part1_Training_GroundTruth.zip',
-            'test_images': 'https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part1_Test_Data.zip',
-            'test_masks': 'https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part1_Test_GroundTruth.zip'
-        }
 
         print("Note: Please manually download ISIC 2016 from https://challenge.isic-archive.com/data/")
         print("Expected directory structure:")
@@ -87,75 +79,115 @@ class DatasetPreparator:
                 mask_np = (mask_np > 127).astype(np.uint8) * 255
                 Image.fromarray(mask_np).save(mask_dest / (img_path.stem + '.png'))
 
-    def prepare_drive(self):
-        """Prepare DRIVE Retinal Vessel Segmentation Dataset"""
-        print("Preparing DRIVE dataset...")
+    def prepare_glas(self):
+        """Prepare GlaS - Gland Segmentation in Colon Histology Images Dataset"""
+        print("Preparing GlaS dataset...")
 
         # Create directories
         for split in ['train', 'test']:
             (self.dataset_dir / split / 'images').mkdir(parents=True, exist_ok=True)
             (self.dataset_dir / split / 'masks').mkdir(parents=True, exist_ok=True)
 
-        print("Note: Please manually download DRIVE from https://drive.grand-challenge.org/")
-        print("Expected directory structure:")
+        print("Note: Please manually download GlaS from https://warwick.ac.uk/fac/cross_fac/tia/data/glascontest/")
+        print("Expected directory structure (original data):")
         print(f"{self.dataset_dir}/")
-        print("  ├── training/")
-        print("  │   ├── images/")
-        print("  │   └── 1st_manual/")
-        print("  └── test/")
-        print("      ├── images/")
-        print("      └── 1st_manual/")
+        print("  ├── train/")
+        print("  │   ├── train_1.bmp")
+        print("  │   ├── train_1_anno.bmp")
+        print("  │   ├── train_2.bmp")
+        print("  │   └── ...")
+        print("  └── test/  (testA and testB files mixed)")
+        print("      ├── testA_1.bmp")
+        print("      ├── testA_1_anno.bmp")
+        print("      ├── testB_1.bmp")
+        print("      ├── testB_1_anno.bmp")
+        print("      └── ...")
 
         # Process images
-        self._process_drive_split('training', 'train')
-        self._process_drive_split('test', 'test')
+        self._process_glas_split('train', 'train')
+        self._process_glas_split('test', 'test')
 
-        print(f"DRIVE dataset prepared at {self.dataset_dir}")
+        print(f"GlaS dataset prepared at {self.dataset_dir}")
 
-    def _process_drive_split(self, source_split, target_split):
-        """Process DRIVE images and masks"""
-        img_source = self.dataset_dir / source_split / 'images'
-        mask_source = self.dataset_dir / source_split / '1st_manual'
+    def _process_glas_split(self, source_split, target_split):
+        """Process GlaS images and masks"""
+        # Handle different possible source directory structures
+        possible_sources = [
+            self.dataset_dir / source_split,
+            self.dataset_dir / 'Warwick QU Dataset (Released 2016_07_08)' / source_split,
+            self.dataset_dir / 'GlaS' / source_split,
+        ]
 
-        if not img_source.exists() or not mask_source.exists():
-            print(f"Warning: Source directories for {source_split} split not found. Skipping...")
+        img_source = None
+        for src in possible_sources:
+            if src.exists():
+                img_source = src
+                break
+
+        if img_source is None:
+            print(f"Warning: Source directory for {source_split} split not found. Skipping...")
+            print(f"Tried the following paths:")
+            for src in possible_sources:
+                print(f"  - {src}")
             return
 
         img_dest = self.dataset_dir / target_split / 'images'
         mask_dest = self.dataset_dir / target_split / 'masks'
 
-        img_files = sorted(list(img_source.glob('*.tif')) + list(img_source.glob('*.png')))
+        # Find all image files (not annotation files)
+        # For train: train_*.bmp (excluding *_anno.bmp)
+        # For test: testA_*.bmp and testB_*.bmp (excluding *_anno.bmp)
+        all_bmp_files = sorted(list(img_source.glob('*.bmp')))
+
+        # Filter out annotation files
+        img_files = [f for f in all_bmp_files if '_anno' not in f.stem]
+
+        if len(img_files) == 0:
+            print(f"Warning: No image files found in {img_source}. Skipping...")
+            return
+
+        print(f"Found {len(img_files)} images in {source_split} split")
 
         for img_path in tqdm(img_files, desc=f"Processing {source_split} split"):
-            # Load and preprocess image
-            img = cv2.imread(str(img_path))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            try:
+                # Load and preprocess image
+                img = Image.open(img_path).convert('RGB')
 
-            # Apply CLAHE to green channel for better contrast
-            img_lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            img_lab[:, :, 0] = clahe.apply(img_lab[:, :, 0])
-            img = cv2.cvtColor(img_lab, cv2.COLOR_LAB2RGB)
+                # Resize to 512x512 (GlaS images are typically 775x522)
+                img_resized = img.resize((512, 512), Image.BILINEAR)
 
-            # Resize to 512x512
-            img = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LINEAR)
-            Image.fromarray(img).save(img_dest / (img_path.stem + '.png'))
+                # Save as PNG (better for medical images)
+                output_name = img_path.stem + '.png'
+                img_resized.save(img_dest / output_name)
 
-            # Process mask
-            mask_name = img_path.stem.replace('_training', '').replace('_test', '') + '_manual1.gif'
-            mask_path = mask_source / mask_name
+                # Process corresponding mask
+                # Mask naming: original_name_anno.bmp
+                mask_name = img_path.stem + '_anno.bmp'
+                mask_path = img_source / mask_name
 
-            if mask_path.exists():
-                mask = Image.open(mask_path).convert('L')
-                mask = mask.resize((512, 512), Image.NEAREST)
-                mask_np = np.array(mask)
-                mask_np = (mask_np > 127).astype(np.uint8) * 255
-                Image.fromarray(mask_np).save(mask_dest / (img_path.stem + '.png'))
+                if mask_path.exists():
+                    mask = Image.open(mask_path).convert('L')
+                    mask_resized = mask.resize((512, 512), Image.NEAREST)
+
+                    # Binarize mask (GlaS uses different values for different glands)
+                    # We convert to binary: any non-zero value becomes 255
+                    mask_np = np.array(mask_resized)
+                    mask_np = (mask_np > 0).astype(np.uint8) * 255
+
+                    Image.fromarray(mask_np).save(mask_dest / output_name)
+                else:
+                    print(f"Warning: Mask not found for {img_path.name}: {mask_path}")
+
+            except Exception as e:
+                print(f"Error processing {img_path.name}: {e}")
+                continue
+
+        print(f"Processed {len(list(img_dest.glob('*.png')))} images for {target_split} split")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Prepare medical image datasets')
-    parser.add_argument('--dataset', type=str, required=True, choices=['isic2016', 'drive'],
+    parser.add_argument('--dataset', type=str, required=True, choices=['isic2016', 'glas'],
                         help='Dataset to prepare')
     parser.add_argument('--data_dir', type=str, default='./data',
                         help='Root directory for datasets')

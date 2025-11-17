@@ -16,12 +16,13 @@ class DiffUNet(nn.Module):
     """
 
     def __init__(self, in_channels=3, num_classes=1, image_size=256,
-                 num_train_timesteps=1000, beta_schedule="linear"):
+                 num_train_timesteps=1000, beta_schedule="linear", **kwargs):
         super().__init__()
 
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.image_size = image_size
+        self.num_train_timesteps = num_train_timesteps
 
         # Encoder (uses diffusion UNet as feature extractor)
         self.encoder = UNet2DModel(
@@ -86,7 +87,8 @@ class DiffUNet(nn.Module):
         noisy_x = x + noise
 
         # Single denoising step through encoder
-        denoised = self.encoder(noisy_x, timestep=torch.tensor([500]).to(x.device)).sample
+        timestep = torch.tensor([self.num_train_timesteps // 2]).to(x.device)
+        denoised = self.encoder(noisy_x, timestep).sample
         return denoised
 
     def training_step(self, images, masks):

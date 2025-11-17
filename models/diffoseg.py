@@ -1,6 +1,7 @@
 """
 DiffOSeg: Omni Medical Image Segmentation via Multi-Expert Collaboration Diffusion Model
-Based on multi-expert collaboration approach
+Based on: https://arxiv.org/abs/2507.13087
+Note: This implementation adapts the multi-expert collaboration concept for single-annotation segmentation
 """
 
 import torch
@@ -19,8 +20,10 @@ class ExpertUNet(nn.Module):
         self.expert_id = expert_id
 
         # Specialized channels for each expert
+        # Use multiples of 32 to ensure compatibility with GroupNorm
         base_channels = [64, 128, 256, 512]
-        expert_channels = [c + expert_id * 16 for c in base_channels]
+        # Add 32 * expert_id to ensure all channels are divisible by 32
+        expert_channels = [c + expert_id * 32 for c in base_channels]
 
         self.unet = UNet2DModel(
             sample_size=image_size,
@@ -52,20 +55,15 @@ class ExpertCollaborationModule(nn.Module):
     def __init__(self, num_experts, feature_dim):
         super().__init__()
 
-        # Attention-based fusion
-        self.attention = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=4,
-            batch_first=True
-        )
+        self.num_experts = num_experts
 
-        # Fusion weights
+        # Learnable fusion weights
         self.fusion_weights = nn.Parameter(torch.ones(num_experts) / num_experts)
 
-        # Refinement
+        # Refinement network
         self.refine = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, 3, padding=1),
-            nn.BatchNorm2d(feature_dim),
+            nn.GroupNorm(num_groups=min(32, feature_dim), num_channels=feature_dim),
             nn.ReLU(inplace=True),
             nn.Conv2d(feature_dim, feature_dim, 3, padding=1)
         )
@@ -77,11 +75,7 @@ class ExpertCollaborationModule(nn.Module):
         Returns:
             Fused features [B, C, H, W]
         """
-        # Stack expert features
-        stacked = torch.stack(expert_features, dim=1)  # [B, num_experts, C, H, W]
-        B, N, C, H, W = stacked.shape
-
-        # Weighted fusion
+        # Weighted fusion with softmax normalized weights
         weights = F.softmax(self.fusion_weights, dim=0)
         weighted = sum(w * feat for w, feat in zip(weights, expert_features))
 
@@ -98,7 +92,7 @@ class DiffOSeg(nn.Module):
 
     def __init__(self, in_channels=3, num_classes=1, image_size=256,
                  num_experts=3, num_train_timesteps=1000,
-                 beta_schedule="linear", num_inference_steps=50):
+                 beta_schedule="linear", num_inference_steps=50, **kwargs):
         super().__init__()
 
         self.in_channels = in_channels
@@ -106,6 +100,7 @@ class DiffOSeg(nn.Module):
         self.image_size = image_size
         self.num_experts = num_experts
         self.num_inference_steps = num_inference_steps
+        self.num_train_timesteps = num_train_timesteps
 
         # Multiple expert networks
         self.experts = nn.ModuleList([
@@ -207,26 +202,40 @@ class DiffOSeg(nn.Module):
         collab_loss = F.mse_loss(collab_pred, noise)
 
         # Diversity loss (encourage expert specialization)
+        # Negative MSE encourages diversity
         diversity_loss = 0
+        num_pairs = 0
         for i in range(len(expert_preds)):
             for j in range(i + 1, len(expert_preds)):
                 diversity_loss -= F.mse_loss(expert_preds[i], expert_preds[j])
-        diversity_loss = diversity_loss / (len(expert_preds) * (len(expert_preds) - 1) / 2)
+                num_pairs += 1
 
-        # Segmentation consistency
-        with torch.no_grad():
-            pred_masks = self.forward(images)
+        if num_pairs > 0:
+            diversity_loss = diversity_loss / num_pairs
 
-        seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
-        dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
+        # Segmentation consistency (sparse, for stability)
+        if torch.rand(1).item() < 0.1:  # 10% of the time
+            with torch.no_grad():
+                pred_masks = self.forward(images)
 
-        # Combined loss
-        total_loss = (
+            seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
+            dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
+
+            total_loss = (
                 collab_loss +
                 0.3 * sum(expert_losses) / len(expert_losses) +
                 0.1 * diversity_loss +
                 0.1 * (seg_loss + dice_loss)
-        )
+            )
+        else:
+            seg_loss = torch.tensor(0.0, device=device)
+            dice_loss = torch.tensor(0.0, device=device)
+
+            total_loss = (
+                collab_loss +
+                0.3 * sum(expert_losses) / len(expert_losses) +
+                0.1 * diversity_loss
+            )
 
         return {
             'loss': total_loss,

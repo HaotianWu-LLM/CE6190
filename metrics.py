@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from scipy.spatial.distance import directed_hausdorff
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import roc_auc_score
 import cv2
 
 
@@ -109,7 +109,7 @@ class MetricsTracker:
 
         avg_metrics = {}
         for key in self.metrics_list[0].keys():
-            values = [m[key] for m in self.metrics_list if not np.isnan(m[key])]
+            values = [m[key] for m in self.metrics_list if not np.isnan(m[key]) and not np.isinf(m[key])]
             avg_metrics[key] = np.mean(values) if values else np.nan
             avg_metrics[f'{key}_std'] = np.std(values) if values else np.nan
 

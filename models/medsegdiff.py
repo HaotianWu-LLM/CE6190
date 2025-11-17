@@ -11,7 +11,7 @@ import numpy as np
 
 
 class ConditionalUNet(nn.Module):
-    """UNet conditioned on segmentation masks"""
+    """UNet conditioned on input images"""
 
     def __init__(self, in_channels=3, cond_channels=1, image_size=256):
         super().__init__()
@@ -44,7 +44,7 @@ class ConditionalUNet(nn.Module):
             condition: Conditioning image [B, C, H, W]
         """
         # Concatenate condition
-        x_cond = torch.cat([x, condition], dim=1)
+        x_cond = torch.cat([condition, x], dim=1)
         return self.unet(x_cond, timestep).sample
 
 
@@ -55,13 +55,14 @@ class MedSegDiff(nn.Module):
 
     def __init__(self, in_channels=3, num_classes=1, image_size=256,
                  num_train_timesteps=1000, beta_schedule="linear",
-                 num_inference_steps=50):
+                 num_inference_steps=50, **kwargs):
         super().__init__()
 
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.image_size = image_size
         self.num_inference_steps = num_inference_steps
+        self.num_train_timesteps = num_train_timesteps
 
         # Conditional UNet for mask generation
         self.model = ConditionalUNet(
@@ -140,15 +141,17 @@ class MedSegDiff(nn.Module):
         diffusion_loss = F.mse_loss(noise_pred, noise)
 
         # Optional: Add segmentation consistency loss
-        # Generate prediction and compare with GT
-        with torch.no_grad():
-            pred_masks = self.forward(images)
-
-        seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
-        dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
-
-        # Weighted combination
-        total_loss = diffusion_loss + 0.1 * (seg_loss + dice_loss)
+        # Generate prediction and compare with GT (during training for stability)
+        if torch.rand(1).item() < 0.1:  # 10% of the time
+            with torch.no_grad():
+                pred_masks = self.forward(images)
+            seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
+            dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
+            total_loss = diffusion_loss + 0.1 * (seg_loss + dice_loss)
+        else:
+            total_loss = diffusion_loss
+            seg_loss = torch.tensor(0.0)
+            dice_loss = torch.tensor(0.0)
 
         return {
             'loss': total_loss,

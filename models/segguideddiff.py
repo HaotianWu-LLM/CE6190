@@ -1,7 +1,8 @@
 """
 SegGuidedDiff: Anatomically-Controllable Medical Image Generation
 with Segmentation-Guided Diffusion Models
-Adapted from the provided codebase for segmentation task
+Based on: https://arxiv.org/abs/2402.05210
+Adapted for segmentation task using bidirectional conditioning
 """
 
 import torch
@@ -19,13 +20,14 @@ class SegGuidedDiff(nn.Module):
 
     def __init__(self, in_channels=3, num_classes=1, image_size=256,
                  num_train_timesteps=1000, beta_schedule="linear",
-                 num_inference_steps=50, use_ddim=True):
+                 num_inference_steps=50, use_ddim=True, **kwargs):
         super().__init__()
 
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.image_size = image_size
         self.num_inference_steps = num_inference_steps
+        self.num_train_timesteps = num_train_timesteps
 
         # Image-to-Mask UNet (for segmentation)
         self.img2mask_unet = UNet2DModel(
@@ -152,15 +154,18 @@ class SegGuidedDiff(nn.Module):
 
         loss_mask2img = F.mse_loss(noise_pred_img, noise_img)
 
-        # 3. Segmentation consistency loss
-        with torch.no_grad():
-            pred_masks = self.forward(images)
+        # 3. Segmentation consistency loss (sparse, for stability)
+        if torch.rand(1).item() < 0.1:  # 10% of the time
+            with torch.no_grad():
+                pred_masks = self.forward(images)
 
-        seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
-        dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
-
-        # Combined loss
-        total_loss = loss_img2mask + 0.5 * loss_mask2img + 0.1 * (seg_loss + dice_loss)
+            seg_loss = F.binary_cross_entropy_with_logits(pred_masks, masks)
+            dice_loss = 1 - self._dice_coefficient(torch.sigmoid(pred_masks), masks)
+            total_loss = loss_img2mask + 0.5 * loss_mask2img + 0.1 * (seg_loss + dice_loss)
+        else:
+            seg_loss = torch.tensor(0.0)
+            dice_loss = torch.tensor(0.0)
+            total_loss = loss_img2mask + 0.5 * loss_mask2img
 
         return {
             'loss': total_loss,
